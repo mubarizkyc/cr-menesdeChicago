@@ -1,0 +1,37 @@
+services:
+  spark-batch:
+    build: .
+    container_name: chicago-crime-batch
+    environment:
+      - DATA_DIR=/data
+      - OUTPUT_DIR=/output
+    volumes:
+      - ./data:/data
+      - ./output:/output
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        chown -R root:root /output /data &&
+        /opt/spark/bin/spark-submit \
+          --master local[2] \
+          --driver-memory 6g \
+          --conf spark.driver.maxResultSize=1g \
+          --conf spark.executor.heartbeatInterval=60s \
+          --conf spark.network.timeout=300s \
+          --conf spark.rpc.askTimeout=300s \
+          --conf spark.rpc.lookupTimeout=300s \
+          --conf spark.sql.shuffle.partitions=50 \
+          --conf spark.sql.adaptive.enabled=true \
+          --conf spark.sql.adaptive.coalescePartitions.enabled=true \
+          --conf spark.sql.adaptive.skewJoin.enabled=true \
+          --conf spark.memory.fraction=0.7 \
+          --conf spark.memory.storageFraction=0.3 \
+          --conf spark.serializer=org.apache.spark.serializer.KryoSerializer \
+          --conf spark.shuffle.compress=true \
+          --conf spark.shuffle.spill.compress=true \
+          --conf spark.sql.optimizer.constraintPropagation.enabled=false \
+          /app/batch_layer.py
+    deploy:
+      resources:
+        limits:
+          memory: 8G
