@@ -1,3 +1,7 @@
 data/
 output/
 *.csv
+
+# Added by cargo
+
+/target

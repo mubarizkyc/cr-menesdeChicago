@@ -1,0 +1,5 @@
+com/mycompany/app/model/Crime.class
+com/mycompany/app/bolt/ParseBolt.class
+com/mycompany/app/bolt/WindowBolt.class
+com/mycompany/app/bolt/DistrictBolt.class
+com/mycompany/app/bolt/AnomalyBolt.class

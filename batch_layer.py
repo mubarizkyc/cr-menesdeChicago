@@ -4,25 +4,26 @@ Chicago Crime Data — Batch Layer (Apache Spark)
 Complete implementation with exact schemas matching uploaded CSV headers.
 """
 
+
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, to_timestamp, year, month, hour, dayofweek, dayofmonth,
-    count, sum as spark_sum, avg, when, isnan, lit, regexp_replace,
-    trim, upper, lower, concat_ws, split, explode, coalesce, round as spark_round,
-    to_date, regexp_extract, abs as spark_abs, monotonically_increasing_id,
-    length, substring,
-    countDistinct, sqrt as spark_sqrt,
-    cos as spark_cos,          # FIX 1 — needed for correct haversine formula
+    col, to_timestamp, year, month, hour, dayofweek,
+    count, sum as spark_sum, avg, when, isnan, lit,
+    trim, upper, lower, coalesce, round as spark_round,
+    to_date, regexp_extract, monotonically_increasing_id,
+    length, substring, countDistinct, sqrt as spark_sqrt,
+    cos as spark_cos, broadcast,
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType,
-    TimestampType, BooleanType, DateType, FloatType
+    TimestampType, BooleanType, DateType, FloatType,
 )
 from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml.clustering import KMeans
 from pyspark.ml import Pipeline
-import os
-import sys
+import os, sys, json, re
+from datetime import datetime, date
+ 
 
 # =============================================================================
 # CONFIGURATION
@@ -36,6 +37,124 @@ POLICE_STATIONS_PATH = os.path.join(DATA_DIR, "Police_Stations_20260420.csv")
 VIOLENCE_PATH        = os.path.join(DATA_DIR, "violence_reduction.csv")
 SEX_OFFENDERS_PATH   = os.path.join(DATA_DIR, "sex_offenders.csv")
 
+# Large join tables are written with Spark's streaming JSON writer (no collect).
+# All analytical / aggregated tables are small enough to collect → pretty JSON + SQL.
+# Threshold (rows) above which we switch to streaming write instead of collect.
+LARGE_TABLE_THRESHOLD = 100_000
+ 
+# =============================================================================
+# OUTPUT HELPERS
+# =============================================================================
+ 
+def _sql_identifier(name: str) -> str:
+    """Snake-case string → safe SQL table/column name."""
+    return re.sub(r"[^a-z0-9_]", "_", name.lower())
+ 
+ 
+def _py_to_sql_literal(value) -> str:
+    """Convert a Python scalar to a SQL literal string."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return f"'{value}'"
+    # String — escape single quotes
+    return "'" + str(value).replace("'", "''") + "'"
+ 
+ 
+def _spark_type_to_sql(spark_type) -> str:
+    """Map a Spark DataType to a portable SQL column type."""
+    from pyspark.sql.types import (
+        IntegerType, LongType, DoubleType, FloatType,
+        BooleanType, TimestampType, DateType, StringType,
+    )
+    mapping = {
+        IntegerType:   "INTEGER",
+        LongType:      "BIGINT",
+        DoubleType:    "DOUBLE PRECISION",
+        FloatType:     "REAL",
+        BooleanType:   "BOOLEAN",
+        TimestampType: "TIMESTAMP",
+        DateType:      "DATE",
+        StringType:    "TEXT",
+    }
+    for spark_cls, sql_type in mapping.items():
+        if isinstance(spark_type, spark_cls):
+            return sql_type
+    return "TEXT"   # fallback
+ 
+ 
+def write_output(df, table_name: str, output_dir: str, description: str = "") -> None:
+    """
+    Write a Spark DataFrame to:
+      • <output_dir>/json/<table_name>.json   — pretty-printed JSON array
+      • <output_dir>/sql/<table_name>.sql     — CREATE TABLE + INSERT INTO statements
+ 
+    For large DataFrames (> LARGE_TABLE_THRESHOLD rows) the JSON is written
+    using Spark's partitioned writer (newline-delimited) to avoid OOM on
+    collect(), and only the SQL DDL (no INSERT rows) is written.
+    """
+    sql_dir  = os.path.join(output_dir, "sql")
+    os.makedirs(sql_dir,  exist_ok=True)
+ 
+    table_id = _sql_identifier(table_name)
+    schema   = df.schema
+ 
+    # ── 1. SQL DDL (CREATE TABLE) ────────────────────────────────────────────
+    col_defs = ",\n    ".join(
+        f"{_sql_identifier(f.name)} {_spark_type_to_sql(f.dataType)}"
+        for f in schema.fields
+        if f.name != "_corrupt_record"
+    )
+    sql_lines = []
+    if description:
+        sql_lines.append(f"-- {description}")
+    sql_lines.append(f"-- Generated: {datetime.utcnow().isoformat()}Z")
+    sql_lines.append(f"\nDROP TABLE IF EXISTS {table_id};")
+    sql_lines.append(f"CREATE TABLE {table_id} (\n    {col_defs}\n);\n")
+ 
+    row_count = df.count()
+    print(f"    [{table_name}] {row_count:,} rows")
+ 
+    clean_cols = [f.name for f in schema.fields if f.name != "_corrupt_record"]
+    df_clean   = df.select(*clean_cols)
+ 
+    if row_count <= LARGE_TABLE_THRESHOLD:
+        # ── Small table: collect → pretty JSON array + SQL INSERT rows ────────
+        rows = df_clean.collect()
+ 
+        # SQL INSERT
+        if rows:
+            col_list = ", ".join(_sql_identifier(c) for c in clean_cols)
+            insert_prefix = f"INSERT INTO {table_id} ({col_list}) VALUES\n"
+            value_rows = []
+            for row in rows:
+                vals = ", ".join(
+                    _py_to_sql_literal(row[c]) for c in clean_cols
+                )
+                value_rows.append(f"    ({vals})")
+            sql_lines.append(insert_prefix + ",\n".join(value_rows) + ";")
+ 
+    else:
+        # ── Large table: DDL Only ────────────────────────────────────────────
+        # Generating INSERTs for large datasets creates huge, slow SQL files.
+        # We provide the schema so the table can be created, but data loading
+        # should ideally be done via Parquet/CSV import in the target DB.
+        sql_lines.append(f"-- NOTE: Table has {row_count:,} rows.")
+        sql_lines.append(f"-- INSERT statements omitted for performance.")
+        sql_lines.append(f"-- Please load data from source Parquet/CSV files directly into {table_id}.")
+        print(f"    → DDL only (Data omitted due to size: {row_count:,} rows)")
+ 
+    # Write SQL file
+    sql_path = os.path.join(sql_dir, f"{table_id}.sql")
+    with open(sql_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(sql_lines) + "\n")
+    print(f"    → {sql_path}")
+ 
+ 
 # =============================================================================
 # EXACT SCHEMAS (matching uploaded CSV headers)
 # =============================================================================
@@ -298,222 +417,160 @@ def load_and_clean(spark, path, schema, dataset_name):
 # =============================================================================
 # ANALYTICS
 # =============================================================================
-
+ 
 def compute_crime_trends(crimes_df, output_dir):
-    """Compute yearly, monthly, hourly, and day-of-week trends."""
-    print(f"\n{'='*60}")
-    print("COMPUTING: Crime Trends")
-    print(f"{'='*60}")
-
-    print("  -> Yearly trends...")
+    print(f"\n{'='*60}\nCOMPUTING: Crime Trends\n{'='*60}")
+ 
     yearly = crimes_df.groupBy("year").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests"),
-        spark_round(
-            spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
+        spark_round(spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
         ).alias("arrest_rate_pct")
     ).orderBy("year")
     yearly.show(5)
-    yearly.write.mode("overwrite").parquet(os.path.join(output_dir, "yearly_trends"))
-
-    print("  -> Monthly trends...")
+    write_output(yearly, "yearly_trends", output_dir, "Total crimes and arrests per year")
+ 
     monthly = crimes_df.groupBy("month").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
     ).orderBy("month")
-    monthly.write.mode("overwrite").parquet(os.path.join(output_dir, "monthly_trends"))
-
-    print("  -> Monthly trends by year...")
+    write_output(monthly, "monthly_trends", output_dir, "Aggregated crime counts by month (all years)")
+ 
     monthly_by_year = crimes_df.groupBy("year", "month").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
     ).orderBy("year", "month")
-    monthly_by_year.write.mode("overwrite").parquet(os.path.join(output_dir, "monthly_trends_by_year"))
-
-    print("  -> Hourly trends...")
+    write_output(monthly_by_year, "monthly_trends_by_year", output_dir, "Crime counts per month per year")
+ 
     hourly = crimes_df.groupBy("hour").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
     ).orderBy("hour")
-    hourly.write.mode("overwrite").parquet(os.path.join(output_dir, "hourly_trends"))
-
-    print("  -> Day-of-week trends...")
+    write_output(hourly, "hourly_trends", output_dir, "Crime counts broken down by hour of day (0-23)")
+ 
     dow = crimes_df.groupBy("day_of_week").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
     ).orderBy("day_of_week")
-    dow.write.mode("overwrite").parquet(os.path.join(output_dir, "day_of_week_trends"))
-
+    write_output(dow, "day_of_week_trends", output_dir, "Crime counts by day of week (1=Sunday, 7=Saturday)")
+ 
     print("  [DONE] Crime trends written.")
-
-
+ 
+ 
 def compute_arrest_rates(crimes_df, arrests_df, output_dir):
-    """Compute arrest rates by crime type, district, and race."""
-    print(f"\n{'='*60}")
-    print("COMPUTING: Arrest Rates")
-    print(f"{'='*60}")
-
-    print("  -> By crime type...")
+    print(f"\n{'='*60}\nCOMPUTING: Arrest Rates\n{'='*60}")
+ 
     by_type = crimes_df.groupBy("primary_type").agg(
         count("*").alias("total_incidents"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests"),
-        spark_round(
-            spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
+        spark_round(spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
         ).alias("arrest_rate_pct")
     ).orderBy(col("total_incidents").desc())
     by_type.show(5, truncate=False)
-    by_type.write.mode("overwrite").parquet(os.path.join(output_dir, "arrest_rate_by_crime_type"))
-
-    print("  -> By district...")
+    write_output(by_type, "arrest_rate_by_crime_type", output_dir, "Arrest rate per primary crime type")
+ 
     by_district = crimes_df.groupBy("district").agg(
         count("*").alias("total_incidents"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests"),
-        spark_round(
-            spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
+        spark_round(spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
         ).alias("arrest_rate_pct")
     ).orderBy("district")
-    by_district.write.mode("overwrite").parquet(os.path.join(output_dir, "arrest_rate_by_district"))
-
-    print("  -> By race (from arrests)...")
+    write_output(by_district, "arrest_rate_by_district", output_dir, "Arrest rate per police district")
+ 
     by_race = arrests_df.groupBy("race").agg(
         count("*").alias("total_arrests")
     ).orderBy(col("total_arrests").desc())
     by_race.show(5, truncate=False)
-    by_race.write.mode("overwrite").parquet(os.path.join(output_dir, "arrest_rate_by_race"))
-
-    print("  -> Arrest rate by race (crimes + arrests join)...")
+    write_output(by_race, "arrest_rate_by_race", output_dir, "Total arrests by race (from arrests dataset)")
+ 
     crimes_with_race = crimes_df.join(
         arrests_df.select("case_number", "race").distinct(),
-        on="case_number",
-        how="left"
+        on="case_number", how="left"
     )
     by_race_crime = crimes_with_race.filter(col("race").isNotNull()).groupBy("race").agg(
         count("*").alias("total_crime_incidents"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests"),
-        spark_round(
-            spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
+        spark_round(spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
         ).alias("arrest_rate_pct")
     ).orderBy(col("total_crime_incidents").desc())
     by_race_crime.show(5, truncate=False)
-    by_race_crime.write.mode("overwrite").parquet(os.path.join(output_dir, "arrest_rate_by_race_detailed"))
-
+    write_output(by_race_crime, "arrest_rate_by_race_detailed", output_dir,
+                 "Arrest rate by race (crimes joined with arrests)")
+ 
     print("  [DONE] Arrest rates written.")
-
-
+ 
+ 
 def compute_joins(spark, crimes_df, arrests_df, stations_df, output_dir):
-    """Join datasets on key columns."""
-    print(f"\n{'='*60}")
-    print("COMPUTING: Dataset Joins")
-    print(f"{'='*60}")
-
-    # ── Crimes ⋈ Arrests on case_number ──────────────────────────────────────
-    # Prune to only the columns downstream consumers need before joining.
-    # Carrying all ~47 combined columns through Spark's constraint propagation
-    # is what caused the Java heap OOM — the ExpressionSet grows O(n²) with
-    # the number of AtLeastNNonNulls constraints produced by dropna().
+    print(f"\n{'='*60}\nCOMPUTING: Dataset Joins\n{'='*60}")
+ 
+    # ── Crimes ⋈ Arrests ────────────────────────────────────────────────────
     print("  -> Crimes JOIN Arrests (case_number)...")
-
-    crimes_cols = ["case_number", "date", "primary_type", "description",
-                   "arrest", "domestic", "district", "ward", "community_area",
-                   "latitude", "longitude", "year", "month", "hour", "day_of_week"]
+    crimes_cols  = ["case_number", "date", "primary_type", "description",
+                    "arrest", "domestic", "district", "ward", "community_area",
+                    "latitude", "longitude", "year", "month", "hour", "day_of_week"]
     arrests_cols = ["case_number", "arrest_date", "race",
                     "charge_1_description", "charge_1_type", "charge_1_class",
                     "charges_description", "charges_type", "charges_class"]
-
-    crimes_slim  = crimes_df.select(*crimes_cols)
-    arrests_slim = arrests_df.select(*arrests_cols)
-
-    crimes_arrests = crimes_slim.join(
-        arrests_slim, on="case_number", how="inner"
+ 
+    crimes_arrests = crimes_df.select(*crimes_cols).join(
+        arrests_df.select(*arrests_cols), on="case_number", how="inner"
     )
-    crimes_arrests.write.mode("overwrite").parquet(
-        os.path.join(output_dir, "crimes_join_arrests")
-    )
-    print("      crimes_join_arrests written.")
-
-    # ── Crimes ⋈ Police Stations on district ─────────────────────────────────
-    # Police stations is tiny (~25 rows) — force a broadcast join so no shuffle
-    # is needed and the station side never touches the heap.
+    write_output(crimes_arrests, "crimes_join_arrests", output_dir,
+                 "Inner join of crimes and arrests on case_number")
+ 
+    # ── Crimes ⋈ Police Stations ─────────────────────────────────────────────
     print("  -> Crimes JOIN Police Stations (district)...")
-
     stations_for_join = (stations_df
-        .drop("district")                   # avoid column-name ambiguity with crimes.district
-        .withColumnRenamed("district_clean",  "station_district")
-        .withColumnRenamed("latitude",        "station_lat")
-        .withColumnRenamed("longitude",       "station_lon")
-        .withColumnRenamed("address",         "station_address")
+        .drop("district")
+        .withColumnRenamed("district_clean", "station_district")
+        .withColumnRenamed("latitude",       "station_lat")
+        .withColumnRenamed("longitude",      "station_lon")
+        .withColumnRenamed("address",        "station_address")
         .select("station_district", "district_name",
-                "station_address", "station_lat", "station_lon",
-                "phone", "zip")
+                "station_address", "station_lat", "station_lon", "phone", "zip")
     )
-
-    from pyspark.sql.functions import broadcast
-    crimes_stations = (crimes_df
-        .select("case_number", "date", "primary_type", "arrest",
-                "district", "latitude", "longitude", "year")
+    crimes_stations = (
+        crimes_df.select("case_number", "date", "primary_type", "arrest",
+                         "district", "latitude", "longitude", "year")
         .join(broadcast(stations_for_join),
               crimes_df.district == stations_for_join.station_district,
               how="left")
         .drop("station_district")
     )
-    crimes_stations.write.mode("overwrite").parquet(
-        os.path.join(output_dir, "crimes_join_stations")
-    )
-    print("      crimes_join_stations written.")
+    write_output(crimes_stations, "crimes_join_stations", output_dir,
+                 "Left join of crimes with police station details on district")
+ 
     print("  [DONE] Joins written.")
-
-
+ 
+ 
 def compute_kmeans_hotspots(spark, crimes_df, output_dir, k=10):
-    """Run K-Means clustering on geospatial coordinates to detect crime hotspots."""
-    print(f"\n{'='*60}")
-    print("COMPUTING: K-Means Crime Hotspots")
-    print(f"{'='*60}")
-
+    print(f"\n{'='*60}\nCOMPUTING: K-Means Crime Hotspots\n{'='*60}")
+ 
     geo_df = crimes_df.filter(
-        col("latitude").isNotNull()  &
-        col("longitude").isNotNull() &
-        (~isnan(col("latitude")))    &
-        (~isnan(col("longitude")))   &
-        (col("latitude")  != 0)      &
-        (col("longitude") != 0)
+        col("latitude").isNotNull()  & col("longitude").isNotNull() &
+        (~isnan(col("latitude")))    & (~isnan(col("longitude")))   &
+        (col("latitude") != 0)       & (col("longitude") != 0)
     ).select("id", "case_number", "primary_type", "district", "latitude", "longitude")
-
+ 
     valid_count = geo_df.count()
-    print(f"  Valid geospatial records: {valid_count}")
-
+    print(f"  Valid geospatial records: {valid_count:,}")
     if valid_count < k:
-        print(f"  WARNING: Not enough records for k={k}. Skipping K-Means.")
+        print(f"  WARNING: Not enough records for k={k}. Skipping.")
         return
-
-    assembler = VectorAssembler(
-        inputCols=["latitude", "longitude"],
-        outputCol="features_raw"
-    )
-    scaler = StandardScaler(
-        inputCol="features_raw",
-        outputCol="features",
-        withStd=True,
-        withMean=True
-    )
-    kmeans = KMeans(
-        k=k,
-        seed=42,
-        featuresCol="features",
-        predictionCol="cluster_id",
-        maxIter=100,
-        initSteps=10
-    )
-    pipeline = Pipeline(stages=[assembler, scaler, kmeans])
-    model     = pipeline.fit(geo_df)
+ 
+    assembler = VectorAssembler(inputCols=["latitude", "longitude"], outputCol="features_raw")
+    scaler    = StandardScaler(inputCol="features_raw", outputCol="features",
+                               withStd=True, withMean=True)
+    kmeans    = KMeans(k=k, seed=42, featuresCol="features", predictionCol="cluster_id",
+                       maxIter=100, initSteps=10)
+    model     = Pipeline(stages=[assembler, scaler, kmeans]).fit(geo_df)
     clustered = model.transform(geo_df)
-
-    kmeans_model = model.stages[-1]
-    centers      = kmeans_model.clusterCenters()
-
+    centers   = model.stages[-1].clusterCenters()
+ 
     print("\n  Cluster Centers (lat, lon):")
-    for i, center in enumerate(centers):
-        print(f"    Cluster {i}: ({center[0]:.6f}, {center[1]:.6f})")
-
+    for i, c in enumerate(centers):
+        print(f"    Cluster {i}: ({c[0]:.6f}, {c[1]:.6f})")
+ 
     cluster_summary = clustered.groupBy("cluster_id").agg(
         count("*").alias("crime_count"),
         spark_round(avg("latitude"),  6).alias("avg_lat"),
@@ -525,139 +582,91 @@ def compute_kmeans_hotspots(spark, crimes_df, output_dir, k=10):
             ) * 100.0 / count("*"), 2
         ).alias("violent_crime_pct")
     ).orderBy(col("crime_count").desc())
-
-    print("\n  Top clusters by crime count:")
     cluster_summary.show(10, truncate=False)
-
+ 
     centers_df = spark.createDataFrame(
         [(i, float(c[0]), float(c[1])) for i, c in enumerate(centers)],
         ["cluster_id", "model_center_lat", "model_center_lon"]
     )
     hotspots = cluster_summary.join(centers_df, on="cluster_id")
-
-    hotspots.write.mode("overwrite").parquet(os.path.join(output_dir, "crime_hotspots_kmeans"))
-    clustered.write.mode("overwrite").parquet(os.path.join(output_dir, "crimes_with_clusters"))
-
+    write_output(hotspots,  "crime_hotspots_kmeans",  output_dir,
+                 f"K-Means (k={k}) cluster summaries with centroid coordinates")
+    write_output(clustered.select("id", "case_number", "primary_type",
+                                  "district", "latitude", "longitude", "cluster_id"),
+                 "crimes_with_clusters", output_dir,
+                 "Each crime record annotated with its K-Means cluster ID")
     print("  [DONE] Hotspots written.")
-
-
-def compute_correlations(crimes_df, arrests_df, violence_df, stations_df, sex_offenders_df, output_dir):
-    """Compute cross-dataset correlations."""
-    print(f"\n{'='*60}")
-    print("COMPUTING: Cross-Dataset Correlations")
-    print(f"{'='*60}")
-
-    # -------------------------------------------------------------------------
-    # Correlation 1: Violence rate vs. Arrest rate by district
-    # -------------------------------------------------------------------------
+ 
+ 
+def compute_correlations(crimes_df, arrests_df, violence_df, stations_df,
+                         sex_offenders_df, output_dir):
+    print(f"\n{'='*60}\nCOMPUTING: Cross-Dataset Correlations\n{'='*60}")
+ 
+    # ── 1. Violence rate vs. Arrest rate by district ──────────────────────────
     print("  -> Violence rate vs. Arrest rate by district...")
-
     violence_by_district = violence_df.groupBy("district").agg(
-        count("*").alias("violence_incidents")
-    )
+        count("*").alias("violence_incidents"))
     crime_by_district = crimes_df.groupBy("district").agg(
         count("*").alias("total_crimes"),
-        spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
-    )
-    district_corr = crime_by_district.join(
-        violence_by_district, on="district", how="outer"
-    ).fillna(0)
-
-    district_corr = (district_corr
+        spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests"))
+    district_corr = (crime_by_district
+        .join(violence_by_district, on="district", how="outer")
+        .fillna(0)
         .withColumn("arrest_rate",
-            spark_round(col("total_arrests") / col("total_crimes"), 4))
+            when(col("total_crimes") == 0, lit(0))
+            .otherwise(spark_round(col("total_arrests") / col("total_crimes"), 4)))
         .withColumn("violence_rate",
-            spark_round(col("violence_incidents") / col("total_crimes"), 4))
+            when(col("total_crimes") == 0, lit(0))
+            .otherwise(spark_round(col("violence_incidents") / col("total_crimes"), 4)))
         .withColumn("violence_per_1000",
             spark_round(col("violence_incidents") * 1000.0 / col("total_crimes"), 2))
-        .withColumn("arrest_rate",
-            when(col("total_crimes") == 0, lit(0)).otherwise(col("arrest_rate")))
-        .withColumn("violence_rate",
-            when(col("total_crimes") == 0, lit(0)).otherwise(col("violence_rate")))
     )
-
     corr_val = district_corr.stat.corr("violence_rate", "arrest_rate")
-    print(f"      Pearson correlation (violence_rate vs arrest_rate): {corr_val:.4f}")
+    print(f"      Pearson r (violence_rate vs arrest_rate by district): {corr_val:.4f}")
     district_corr.show(10, truncate=False)
-    district_corr.write.mode("overwrite").parquet(
-        os.path.join(output_dir, "correlation_violence_arrest_by_district")
-    )
-
-    # -------------------------------------------------------------------------
-    # Correlation 2: Crime rate vs. distance to nearest police station
-    # -------------------------------------------------------------------------
+    write_output(district_corr, "correlation_violence_arrest_by_district", output_dir,
+                 f"Violence vs arrest rate by district (Pearson r={corr_val:.4f})")
+ 
+    # ── 2. Crime rate vs. Distance to nearest police station ─────────────────
     print("  -> Crime rate vs. Station distance by district...")
-
     stations_select = (stations_df
         .filter(col("district_clean").isNotNull())
-        .select(
-            col("district_clean").alias("station_dist"),
-            col("latitude").alias("station_lat"),
-            col("longitude").alias("station_lon")
-        )
-    )
-
-    crimes_with_station = crimes_df.join(
-        stations_select,
-        crimes_df.district == stations_select.station_dist,
-        how="left"
-    )
-
-    # FIX 4 — Haversine longitude-degree-to-metres factor.
-    # Original code wrote:
-    #   abs(col("latitude")) * 3.14159 / 180
-    # which is just lat_radians — NOT cos(lat_radians).
-    # It also called Python's built-in abs() on a Column object, which raises
-    # TypeError at runtime.  The correct expression uses spark_cos (imported
-    # at the top of the file).
-    crimes_with_station = (crimes_with_station
-        .withColumn("lat_diff",
-            (col("latitude") - col("station_lat")) * 111_000.0)
+        .select(col("district_clean").alias("station_dist"),
+                col("latitude").alias("station_lat"),
+                col("longitude").alias("station_lon")))
+    crimes_with_dist = (crimes_df
+        .join(stations_select, crimes_df.district == stations_select.station_dist, how="left")
+        .withColumn("lat_diff", (col("latitude") - col("station_lat")) * 111_000.0)
         .withColumn("lon_diff",
             (col("longitude") - col("station_lon")) * 111_000.0
             * spark_cos(col("latitude") * 3.14159265358979 / 180.0))
         .withColumn("distance_to_station_m",
-            spark_round(
-                spark_sqrt(col("lat_diff") * col("lat_diff") +
-                           col("lon_diff") * col("lon_diff")), 2))
+            spark_round(spark_sqrt(col("lat_diff")**2 + col("lon_diff")**2), 2))
     )
-
-    station_dist_stats = crimes_with_station.groupBy("district").agg(
+    station_dist_stats = crimes_with_dist.groupBy("district").agg(
         spark_round(avg("distance_to_station_m"), 2).alias("avg_dist_to_station_m"),
-        count("*").alias("crime_count")
-    )
+        count("*").alias("crime_count"))
     station_dist_stats.show(10, truncate=False)
-    station_dist_stats.write.mode("overwrite").parquet(
-        os.path.join(output_dir, "crime_station_distance_by_district")
-    )
-
-    # -------------------------------------------------------------------------
-    # Correlation 3: Sex offender density vs. crime rate (by block prefix)
-    # -------------------------------------------------------------------------
+    write_output(station_dist_stats, "crime_station_distance_by_district", output_dir,
+                 "Average crime-to-station distance (metres) and total crimes per district")
+ 
+    # ── 3. Sex offender density vs. crime rate (by block prefix) ─────────────
     print("  -> Sex offender density vs. crime rate (by block)...")
-
-    # Normalise block to the numeric prefix (e.g. "014XX" → "014")
     offender_blocks = (sex_offenders_df
         .filter(col("block").isNotNull())
         .withColumn("block_key", regexp_extract(col("block"), r"^(\d+)", 1))
-        .groupBy("block_key")
-        .agg(count("*").alias("offender_count"))
-    )
+        .groupBy("block_key").agg(count("*").alias("offender_count")))
     crime_blocks = (crimes_df
         .filter(col("block").isNotNull())
         .withColumn("block_key", regexp_extract(col("block"), r"^(\d+)", 1))
-        .groupBy("block_key")
-        .agg(count("*").alias("crime_count"))
-    )
+        .groupBy("block_key").agg(count("*").alias("crime_count")))
     block_corr = crime_blocks.join(offender_blocks, on="block_key", how="left").fillna(0)
     corr_block = block_corr.stat.corr("crime_count", "offender_count")
-    print(f"      Pearson correlation (crime_count vs offender_count by block): {corr_block:.4f}")
-    block_corr.write.mode("overwrite").parquet(
-        os.path.join(output_dir, "correlation_offenders_crime_by_block")
-    )
-
+    print(f"      Pearson r (crime_count vs offender_count by block): {corr_block:.4f}")
+    write_output(block_corr, "correlation_offenders_crime_by_block", output_dir,
+                 f"Sex offender density vs crime count by block (Pearson r={corr_block:.4f})")
+ 
     print("  [DONE] Correlations written.")
-
 
 # =============================================================================
 # ENTRY POINT
