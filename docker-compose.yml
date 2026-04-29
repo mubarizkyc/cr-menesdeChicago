@@ -5,16 +5,26 @@ services:
     environment:
       - DATA_DIR=/data
       - OUTPUT_DIR=/output
+      # ✅ Use host.docker.internal for TCP access to host
+      - PG_URL=jdbc:postgresql://host.docker.internal:5432/chicago_crimes
+      - PG_USER=postgres
     volumes:
-      - ./data:/data
-      - ./output:/output
+      - ./data:/data          # ✅ host ./data → container /data
+      - ./output:/output      # ✅ host ./output → container /output
+    # ✅ Critical: Map host.docker.internal to host gateway
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        chown -R root:root /output /data &&
+        set -e
+        chown -R root:root /output /data
+        
         /opt/spark/bin/spark-submit \
           --master local[2] \
           --driver-memory 6g \
+          --packages org.postgresql:postgresql:42.7.3 \
           --conf spark.driver.maxResultSize=1g \
           --conf spark.executor.heartbeatInterval=60s \
           --conf spark.network.timeout=300s \

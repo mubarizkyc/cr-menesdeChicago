@@ -86,74 +86,35 @@ def _spark_type_to_sql(spark_type) -> str:
             return sql_type
     return "TEXT"   # fallback
  
- 
-def write_output(df, table_name: str, output_dir: str, description: str = "") -> None:
+ # =============================================================================
+# POSTGRESQL WRITER
+# =============================================================================
+PG_URL = os.getenv("PG_URL", "jdbc:postgresql://host.docker.internal:5432/chicago_crimes")
+PG_USER = os.getenv("PG_USER", "postgres")
+PG_PROPERTIES = {
+    "user": PG_USER,
+    "driver": "org.postgresql.Driver",
+    "batchsize": "10000",
+    "reWriteBatchedInserts": "true",  # PG-specific optimization
+    "stringtype": "unspecified",      # Prevents type-cast errors on text/varchar
+}
+
+def write_to_postgres(df, table_name: str, mode: str = "overwrite") -> None:
     """
-    Write a Spark DataFrame to:
-      • <output_dir>/json/<table_name>.json   — pretty-printed JSON array
-      • <output_dir>/sql/<table_name>.sql     — CREATE TABLE + INSERT INTO statements
- 
-    For large DataFrames (> LARGE_TABLE_THRESHOLD rows) the JSON is written
-    using Spark's partitioned writer (newline-delimited) to avoid OOM on
-    collect(), and only the SQL DDL (no INSERT rows) is written.
+    Write a Spark DataFrame directly to PostgreSQL via JDBC.
+    mode: "overwrite" (drops & recreates), "append" (adds rows, table must exist)
     """
-    sql_dir  = os.path.join(output_dir, "sql")
-    os.makedirs(sql_dir,  exist_ok=True)
- 
-    table_id = _sql_identifier(table_name)
-    schema   = df.schema
- 
-    # ── 1. SQL DDL (CREATE TABLE) ────────────────────────────────────────────
-    col_defs = ",\n    ".join(
-        f"{_sql_identifier(f.name)} {_spark_type_to_sql(f.dataType)}"
-        for f in schema.fields
-        if f.name != "_corrupt_record"
-    )
-    sql_lines = []
-    if description:
-        sql_lines.append(f"-- {description}")
-    sql_lines.append(f"-- Generated: {datetime.utcnow().isoformat()}Z")
-    sql_lines.append(f"\nDROP TABLE IF EXISTS {table_id};")
-    sql_lines.append(f"CREATE TABLE {table_id} (\n    {col_defs}\n);\n")
- 
+    table_id = _sql_identifier(table_name)  # Reuses your existing helper
     row_count = df.count()
-    print(f"    [{table_name}] {row_count:,} rows")
- 
-    clean_cols = [f.name for f in schema.fields if f.name != "_corrupt_record"]
-    df_clean   = df.select(*clean_cols)
- 
-    if row_count <= LARGE_TABLE_THRESHOLD:
-        # ── Small table: collect → pretty JSON array + SQL INSERT rows ────────
-        rows = df_clean.collect()
- 
-        # SQL INSERT
-        if rows:
-            col_list = ", ".join(_sql_identifier(c) for c in clean_cols)
-            insert_prefix = f"INSERT INTO {table_id} ({col_list}) VALUES\n"
-            value_rows = []
-            for row in rows:
-                vals = ", ".join(
-                    _py_to_sql_literal(row[c]) for c in clean_cols
-                )
-                value_rows.append(f"    ({vals})")
-            sql_lines.append(insert_prefix + ",\n".join(value_rows) + ";")
- 
-    else:
-        # ── Large table: DDL Only ────────────────────────────────────────────
-        # Generating INSERTs for large datasets creates huge, slow SQL files.
-        # We provide the schema so the table can be created, but data loading
-        # should ideally be done via Parquet/CSV import in the target DB.
-        sql_lines.append(f"-- NOTE: Table has {row_count:,} rows.")
-        sql_lines.append(f"-- INSERT statements omitted for performance.")
-        sql_lines.append(f"-- Please load data from source Parquet/CSV files directly into {table_id}.")
-        print(f"    → DDL only (Data omitted due to size: {row_count:,} rows)")
- 
-    # Write SQL file
-    sql_path = os.path.join(sql_dir, f"{table_id}.sql")
-    with open(sql_path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(sql_lines) + "\n")
-    print(f"    → {sql_path}")
- 
+    print(f"    [{table_name}] {row_count:,} rows → PostgreSQL table: {table_id} (mode={mode})")
+    
+    df.write.jdbc(
+        url=PG_URL,
+        table=table_id,
+        mode=mode,
+        properties=PG_PROPERTIES
+    )
+    print(f"    ✓ Successfully written to {table_id}")
  
 # =============================================================================
 # EXACT SCHEMAS (matching uploaded CSV headers)
@@ -428,31 +389,31 @@ def compute_crime_trends(crimes_df, output_dir):
         ).alias("arrest_rate_pct")
     ).orderBy("year")
     yearly.show(5)
-    write_output(yearly, "yearly_trends", output_dir, "Total crimes and arrests per year")
+    write_to_postgres(yearly, "yearly_trends",mode="overwrite")
  
     monthly = crimes_df.groupBy("month").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
     ).orderBy("month")
-    write_output(monthly, "monthly_trends", output_dir, "Aggregated crime counts by month (all years)")
+    write_to_postgres(monthly, "monthly_trends",mode="overwrite")
  
     monthly_by_year = crimes_df.groupBy("year", "month").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
     ).orderBy("year", "month")
-    write_output(monthly_by_year, "monthly_trends_by_year", output_dir, "Crime counts per month per year")
+    write_to_postgres(monthly_by_year, "monthly_trends_by_year", mode="overwrite")
  
     hourly = crimes_df.groupBy("hour").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
     ).orderBy("hour")
-    write_output(hourly, "hourly_trends", output_dir, "Crime counts broken down by hour of day (0-23)")
+    write_to_postgres(hourly, "hourly_trends", mode="overwrite")
  
     dow = crimes_df.groupBy("day_of_week").agg(
         count("*").alias("total_crimes"),
         spark_sum(when(col("arrest") == True, 1).otherwise(0)).alias("total_arrests")
     ).orderBy("day_of_week")
-    write_output(dow, "day_of_week_trends", output_dir, "Crime counts by day of week (1=Sunday, 7=Saturday)")
+    write_to_postgres(dow, "day_of_week_trends", mode="overwrite")
  
     print("  [DONE] Crime trends written.")
  
@@ -467,7 +428,7 @@ def compute_arrest_rates(crimes_df, arrests_df, output_dir):
         ).alias("arrest_rate_pct")
     ).orderBy(col("total_incidents").desc())
     by_type.show(5, truncate=False)
-    write_output(by_type, "arrest_rate_by_crime_type", output_dir, "Arrest rate per primary crime type")
+    write_to_postgres(by_type, "arrest_rate_by_crime_type", mode="overwrite")
  
     by_district = crimes_df.groupBy("district").agg(
         count("*").alias("total_incidents"),
@@ -475,13 +436,13 @@ def compute_arrest_rates(crimes_df, arrests_df, output_dir):
         spark_round(spark_sum(when(col("arrest") == True, 1).otherwise(0)) * 100.0 / count("*"), 2
         ).alias("arrest_rate_pct")
     ).orderBy("district")
-    write_output(by_district, "arrest_rate_by_district", output_dir, "Arrest rate per police district")
+    write_to_postgres(by_district, "arrest_rate_by_district", mode="overwrite")
  
     by_race = arrests_df.groupBy("race").agg(
         count("*").alias("total_arrests")
     ).orderBy(col("total_arrests").desc())
     by_race.show(5, truncate=False)
-    write_output(by_race, "arrest_rate_by_race", output_dir, "Total arrests by race (from arrests dataset)")
+    write_to_postgres(by_race, "arrest_rate_by_race",mode="overwrite")
  
     crimes_with_race = crimes_df.join(
         arrests_df.select("case_number", "race").distinct(),
@@ -494,8 +455,7 @@ def compute_arrest_rates(crimes_df, arrests_df, output_dir):
         ).alias("arrest_rate_pct")
     ).orderBy(col("total_crime_incidents").desc())
     by_race_crime.show(5, truncate=False)
-    write_output(by_race_crime, "arrest_rate_by_race_detailed", output_dir,
-                 "Arrest rate by race (crimes joined with arrests)")
+    write_to_postgres(by_race_crime, "arrest_rate_by_race_detailed", mode="overwrite")
  
     print("  [DONE] Arrest rates written.")
  
@@ -515,8 +475,7 @@ def compute_joins(spark, crimes_df, arrests_df, stations_df, output_dir):
     crimes_arrests = crimes_df.select(*crimes_cols).join(
         arrests_df.select(*arrests_cols), on="case_number", how="inner"
     )
-    write_output(crimes_arrests, "crimes_join_arrests", output_dir,
-                 "Inner join of crimes and arrests on case_number")
+    write_to_postgres(crimes_arrests, "crimes_join_arrests", mode="overwrite")
  
     # ── Crimes ⋈ Police Stations ─────────────────────────────────────────────
     print("  -> Crimes JOIN Police Stations (district)...")
@@ -537,8 +496,7 @@ def compute_joins(spark, crimes_df, arrests_df, stations_df, output_dir):
               how="left")
         .drop("station_district")
     )
-    write_output(crimes_stations, "crimes_join_stations", output_dir,
-                 "Left join of crimes with police station details on district")
+    write_to_postgres(crimes_stations, "crimes_join_stations", mode="overwrite")
  
     print("  [DONE] Joins written.")
  
@@ -589,12 +547,10 @@ def compute_kmeans_hotspots(spark, crimes_df, output_dir, k=10):
         ["cluster_id", "model_center_lat", "model_center_lon"]
     )
     hotspots = cluster_summary.join(centers_df, on="cluster_id")
-    write_output(hotspots,  "crime_hotspots_kmeans",  output_dir,
-                 f"K-Means (k={k}) cluster summaries with centroid coordinates")
-    write_output(clustered.select("id", "case_number", "primary_type",
+    write_to_postgres(hotspots,  "crime_hotspots_kmeans",  mode="overwrite")
+    write_to_postgres(clustered.select("id", "case_number", "primary_type",
                                   "district", "latitude", "longitude", "cluster_id"),
-                 "crimes_with_clusters", output_dir,
-                 "Each crime record annotated with its K-Means cluster ID")
+                 "crimes_with_clusters", mode="overwrite")
     print("  [DONE] Hotspots written.")
  
  
@@ -624,8 +580,7 @@ def compute_correlations(crimes_df, arrests_df, violence_df, stations_df,
     corr_val = district_corr.stat.corr("violence_rate", "arrest_rate")
     print(f"      Pearson r (violence_rate vs arrest_rate by district): {corr_val:.4f}")
     district_corr.show(10, truncate=False)
-    write_output(district_corr, "correlation_violence_arrest_by_district", output_dir,
-                 f"Violence vs arrest rate by district (Pearson r={corr_val:.4f})")
+    write_to_postgres(district_corr, "correlation_violence_arrest_by_district", mode="overwrite")
  
     # ── 2. Crime rate vs. Distance to nearest police station ─────────────────
     print("  -> Crime rate vs. Station distance by district...")
@@ -647,8 +602,7 @@ def compute_correlations(crimes_df, arrests_df, violence_df, stations_df,
         spark_round(avg("distance_to_station_m"), 2).alias("avg_dist_to_station_m"),
         count("*").alias("crime_count"))
     station_dist_stats.show(10, truncate=False)
-    write_output(station_dist_stats, "crime_station_distance_by_district", output_dir,
-                 "Average crime-to-station distance (metres) and total crimes per district")
+    write_to_postgres(station_dist_stats, "crime_station_distance_by_district", mode="overwrite")
  
     # ── 3. Sex offender density vs. crime rate (by block prefix) ─────────────
     print("  -> Sex offender density vs. crime rate (by block)...")
@@ -663,8 +617,7 @@ def compute_correlations(crimes_df, arrests_df, violence_df, stations_df,
     block_corr = crime_blocks.join(offender_blocks, on="block_key", how="left").fillna(0)
     corr_block = block_corr.stat.corr("crime_count", "offender_count")
     print(f"      Pearson r (crime_count vs offender_count by block): {corr_block:.4f}")
-    write_output(block_corr, "correlation_offenders_crime_by_block", output_dir,
-                 f"Sex offender density vs crime count by block (Pearson r={corr_block:.4f})")
+    write_to_postgres(block_corr, "correlation_offenders_crime_by_block", mode="overwrite")
  
     print("  [DONE] Correlations written.")
 
