@@ -17,3 +17,9 @@ open firewal
 ```
 port 5432/tcp # commands vary as per distro
 ```
+## Run spark
+```
+docker compose down # if restarting
+docker compose build --no-cache
+docker compose up
+```
